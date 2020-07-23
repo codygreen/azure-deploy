@@ -2,6 +2,20 @@ data "azurerm_resource_group" "bigiprg" {
   name = var.resource_group_name
 }
 
+data "template_file" "init_file" {
+
+  template = "${file("${path.module}/${var.script_name}.tpl")}"
+  vars = {
+    onboard_log = var.onboard_log
+    libs_dir    = var.libs_dir
+    DO_URL      = var.doPackageUrl
+    AS3_URL     = var.as3PackageUrl
+    TS_URL      = var.tsPackageUrl
+    FAST_URL    = var.fastPackageUrl
+    CFE_URL     = var.cfePackageUrl
+  }
+}
+
 # Create a Public IP for bigip
 resource "azurerm_public_ip" "mgmt_public_ip" {
   count               = var.nb_public_ip
@@ -9,7 +23,8 @@ resource "azurerm_public_ip" "mgmt_public_ip" {
   location            = data.azurerm_resource_group.bigiprg.location
   resource_group_name = data.azurerm_resource_group.bigiprg.name
   allocation_method   = var.allocation_method
-  domain_name_label   = element(var.public_ip_dns, count.index)
+  //domain_name_label   = element(var.public_ip_dns, count.index)
+  domain_name_label = format("%s-%s", var.dnsLabel, count.index)
 
   tags = {
     Name   = "${var.dnsLabel}-pip-${count.index}"
@@ -18,7 +33,7 @@ resource "azurerm_public_ip" "mgmt_public_ip" {
   }
 }
 
-# Create the 1nic interface for BIG-IP 01
+# Deploy BIG-IP with N-Nic interface 
 resource "azurerm_network_interface" "mgmt_nic" {
   count               = var.nb_nics
   name                = "${var.dnsLabel}-nic-${count.index}"
@@ -38,45 +53,12 @@ resource "azurerm_network_interface" "mgmt_nic" {
     source = "terraform"
   }
 }
-resource "azurerm_network_security_group" "bigip_sg" {
-  name                = "${var.dnsLabel}-nsg"
-  resource_group_name = data.azurerm_resource_group.bigiprg.name
-  location            = data.azurerm_resource_group.bigiprg.location
-  security_rule {
-    name                       = "allow_SSH"
-    description                = "Allow SSH access"
-    priority                   = 100
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "Tcp"
-    source_port_range          = "*"
-    destination_port_range     = "22"
-    source_address_prefix      = "*"
-    destination_address_prefix = "*"
-  }
-  security_rule {
-    name                       = "mgmt_allow_HTTPS"
-    description                = "Allow HTTPS access"
-    priority                   = 101
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "Tcp"
-    source_port_range          = "*"
-    destination_port_range     = "443"
-    source_address_prefix      = "*"
-    destination_address_prefix = "*"
-  }
-  tags = {
-    owner  = var.dnsLabel
-    Name   = "${var.dnsLabel}-bigip_sg"
-    source = "terraform"
-  }
-}
 
 resource "azurerm_network_interface_security_group_association" "nicnsg" {
-  count                     = var.nb_nics
-  network_interface_id      = azurerm_network_interface.mgmt_nic[count.index].id
-  network_security_group_id = azurerm_network_security_group.bigip_sg.id
+  count                = var.nb_nics
+  network_interface_id = azurerm_network_interface.mgmt_nic[count.index].id
+  //network_security_group_id = azurerm_network_security_group.bigip_sg.id
+  network_security_group_id = var.vnet_subnet_security_group_ids[count.index]
 }
 
 
@@ -137,6 +119,25 @@ resource "azurerm_virtual_machine" "f5vm01" {
     Name   = "${var.dnsLabel}-f5vm01"
     source = "terraform"
   }
+  depends_on = [azurerm_network_interface_security_group_association.nicnsg]
+}
+
+## ..:: Run Startup Script ::..
+resource "azurerm_virtual_machine_extension" "vmext" {
+
+  name               = "${var.dnsLabel}-vmext1"
+  depends_on         = [azurerm_virtual_machine.f5vm01]
+  virtual_machine_id = azurerm_virtual_machine.f5vm01.id
+
+  publisher            = "Microsoft.Azure.Extensions"
+  type                 = "CustomScript"
+  type_handler_version = "2.0"
+
+  protected_settings = <<PROT
+  {
+    "script": "${base64encode(data.template_file.init_file.rendered)}"
+  }
+  PROT
 }
 
 #Getting Public IP Assigned to BIGIP
